@@ -35,3 +35,5 @@ class PipelineResult:
     stage_trace: List[StageDecision]
     feature_summary: Dict[str, float]
     reasoning: List[str]
+    best_channel_frequency_offset_hz: float = 0.0
+    per_channel_classification_scores: List[Dict[str, float | str]] = field(default_factory=list)

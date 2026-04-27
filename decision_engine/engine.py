@@ -64,6 +64,9 @@ class DecisionEngine:
                 + quality * 0.1
                 + alignment * 0.11,
             )
+            strong_signature = proto not in {"Unknown Digital Signal", "Unknown Narrowband Digital Signal", "Unknown Signal"} and protocol_scores.get(proto, 0.0) >= 0.6
+            if strong_signature:
+                confidence = min(1.0, confidence + 0.18 * protocol_scores.get(proto, 0.0))
             core_validity = max(0.0, min(1.0, features.get("core_feature_validity_score", 0.0)))
             confidence *= (0.1 + 0.9 * core_validity)
 
@@ -113,7 +116,10 @@ class DecisionEngine:
             and c.application == by_stage["Application"].selected
         ]
         if strict_match:
-            best = strict_match[0]
+            strict_best = strict_match[0]
+            # Keep strict stage path only when it is competitive; otherwise preserve highest-confidence candidate.
+            if strict_best.confidence >= best.confidence * 0.95:
+                best = strict_best
         reasoning = best.reasoning[:]
         if constraints.rejections:
             reasoning.append(f"Rejected labels: {', '.join(constraints.rejections)}")
@@ -189,16 +195,26 @@ class DecisionEngine:
     @staticmethod
     def _feature_agreement(features: Dict[str, float], modulation: str, protocol: str) -> float:
         agreement = 0.2
+        snr_db = features.get("snr_db", 0.0)
+        snr_gate = min(1.0, max(0.0, (snr_db - 2.0) / 16.0))
+        if_peak_count = features.get("if_peak_count", 0.0)
+        if_peak_norm = min(1.0, max(0.0, if_peak_count / 4.0))
+        if_var_norm = min(1.0, max(0.0, features.get("if_std", 0.0) / 12_000.0))
+        if_cluster = min(1.0, max(0.0, 0.55 * if_peak_norm + 0.45 * features.get("multi_fsk_score", 0.0)))
         if modulation == "OFDM":
             agreement += min(0.4, features.get("bandwidth_hz", 0.0) / 2_000_000.0)
         if modulation in {"FSK", "MFSK"}:
-            agreement += min(0.4, features.get("if_peak_count", 0.0) / 4.0)
+            agreement += min(0.45, 0.28 * if_peak_norm + 0.17 * if_var_norm)
         if modulation in {"PSK", "QAM"}:
-            agreement += min(0.4, features.get("constellation_stability", 0.0) / 4.0)
+            const_term = min(0.4, features.get("constellation_stability", 0.0) / 4.0)
+            conflict_penalty = 0.5 if if_peak_count >= 2.0 and features.get("constellation_stability", 0.0) < 1.4 else 0.0
+            agreement += max(0.0, const_term * (0.25 + 0.75 * snr_gate) * (1.0 - conflict_penalty) * (1.0 - 0.35 * if_cluster))
         if protocol == "LoRa-like":
             agreement += min(0.3, abs(features.get("if_skew", 0.0)) / 2.0)
         if protocol == "Unknown Narrowband Digital Signal":
             agreement += 0.2 * min(1.0, features.get("cyclic_strength", 0.0))
+        if protocol in {"DMR-like", "LoRa-like", "WiFi-like", "RC-like", "Drone-link-like", "IoT-like", "Analog FM", "Analog Broadcast"}:
+            agreement += 0.12
         agreement += 0.15 * min(1.0, max(0.0, features.get("feature_validity_score", 0.0)))
         return max(0.0, min(1.0, agreement))
 

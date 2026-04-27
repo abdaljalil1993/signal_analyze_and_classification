@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Dict, Iterable, List
 
 import numpy as np
 
@@ -10,6 +10,7 @@ from constraint_engine.physics_rules import apply_physics_constraints
 from decision_engine.engine import DecisionEngine
 from feature_extraction.core import extract_features
 from iq_loader.loader import DTypeName, load_iq_file, stream_iq_file
+from preprocessing.channelization import detect_and_extract_channels
 from preprocessing.filters import preprocess_iq
 from protocol_detectors.detectors import detect_protocols
 from utils.config import DEFAULT_CHUNK_SIZE, DEFAULT_SAMPLE_RATE
@@ -34,25 +35,64 @@ class SigIntPipeline:
     def process_file(self, path: str | Path, dtype_name: DTypeName) -> tuple[PipelineResult, np.ndarray, dict]:
         iq = self._load_analysis_window(path, dtype_name)
         pre = preprocess_iq(iq)
-        features = extract_features(pre, self.sample_rate, cache_key=(str(path), "full", pre.size), use_parallel=True)
+        channels = detect_and_extract_channels(pre, self.sample_rate)
 
-        stage1 = self.classifier._stage_signal_nature(features)
-        stage2 = self.classifier._stage_channel(features, stage1.selected)
-        stage3 = self.classifier._stage_modulation(features, stage1.selected, stage2.selected)
+        per_channel_scores: List[Dict[str, float | str]] = []
+        channel_results: List[tuple[float, PipelineResult, np.ndarray, float, float]] = []
 
-        protocol_scores = detect_protocols(features, stage2.selected, stage3.selected, stage1.selected)
-        stage_trace = self.classifier.classify(features, protocol_scores)
+        for idx, ch in enumerate(channels):
+            result = self._classify_single_channel(
+                ch.iq,
+                ch.sample_rate_hz,
+                cache_key=(str(path), "chan", idx, int(ch.frequency_offset_hz), ch.iq.size),
+            )
+            feature_consistency = 0.5 * (
+                float(result.feature_summary.get("feature_validity_score", 0.0))
+                + float(result.feature_summary.get("core_feature_validity_score", 0.0))
+            )
+            protocol_likelihood = max(result.stage_trace[3].scores.values()) if result.stage_trace and len(result.stage_trace) > 3 else 0.0
+            snr_norm = float(min(1.0, max(0.0, (ch.snr_db + 5.0) / 30.0)))
+            named_protocol_bonus = 1.0 if result.protocol not in {"Unknown Digital Signal", "Unknown Narrowband Digital Signal", "Unknown Signal"} else 0.0
+            channel_score = (
+                0.45 * float(result.confidence)
+                + 0.2 * protocol_likelihood
+                + 0.2 * feature_consistency
+                + 0.1 * snr_norm
+                + 0.05 * named_protocol_bonus
+            )
 
-        constraints = apply_physics_constraints(
-            stage_trace[1].selected,
-            stage_trace[2].scores,
-            stage_trace[3].scores,
-            features,
-        )
-        result = self.decision_engine.build_result(stage_trace, features, constraints)
+            per_channel_scores.append(
+                {
+                    "channel_index": float(idx),
+                    "frequency_offset_hz": float(ch.frequency_offset_hz),
+                    "bandwidth_hz": float(ch.bandwidth_hz),
+                    "snr_db": float(ch.snr_db),
+                    "feature_consistency": float(feature_consistency),
+                    "protocol_likelihood": float(protocol_likelihood),
+                    "selection_score": float(channel_score),
+                    "confidence": float(result.confidence),
+                    "modulation": result.modulation,
+                    "protocol": result.protocol,
+                }
+            )
+            channel_results.append((channel_score, result, ch.iq, ch.frequency_offset_hz, ch.sample_rate_hz))
 
-        plot_data = self._build_plot_data(pre)
-        return result, pre, plot_data
+        if not channel_results:
+            # Fallback should not occur because channelization always yields at least one channel.
+            result = self._classify_single_channel(pre, self.sample_rate, cache_key=(str(path), "fallback", pre.size))
+            result.best_channel_frequency_offset_hz = 0.0
+            result.per_channel_classification_scores = per_channel_scores
+            plot_data = self._build_plot_data(pre, self.sample_rate)
+            return result, pre, plot_data
+
+        channel_results.sort(key=lambda x: x[0], reverse=True)
+        _, best_result, best_iq, best_offset, best_fs = channel_results[0]
+        best_result.best_channel_frequency_offset_hz = float(best_offset)
+        best_result.per_channel_classification_scores = per_channel_scores
+        best_result.feature_summary["best_channel_frequency_offset_hz"] = float(best_offset)
+
+        plot_data = self._build_plot_data(best_iq, best_fs)
+        return best_result, best_iq, plot_data
 
     def _load_analysis_window(self, path: str | Path, dtype_name: DTypeName) -> np.ndarray:
         # Read only a bounded window for interactive latency.
@@ -71,27 +111,69 @@ class SigIntPipeline:
     def process_streaming(self, path: str | Path, dtype_name: DTypeName) -> Iterable[PipelineResult]:
         for idx, chunk in enumerate(stream_iq_file(path, dtype_name, self.chunk_size)):
             pre = preprocess_iq(chunk)
-            features = extract_features(
-                pre,
-                self.sample_rate,
-                cache_key=(str(path), idx, pre.size),
-                use_parallel=True,
-            )
+            channels = detect_and_extract_channels(pre, self.sample_rate)
+            ranked: List[tuple[float, PipelineResult, float]] = []
+            per_channel_scores: List[Dict[str, float | str]] = []
+            for c_idx, ch in enumerate(channels):
+                result = self._classify_single_channel(
+                    ch.iq,
+                    ch.sample_rate_hz,
+                    cache_key=(str(path), idx, "stream-chan", c_idx, int(ch.frequency_offset_hz), ch.iq.size),
+                )
+                feature_consistency = 0.5 * (
+                    float(result.feature_summary.get("feature_validity_score", 0.0))
+                    + float(result.feature_summary.get("core_feature_validity_score", 0.0))
+                )
+                protocol_likelihood = max(result.stage_trace[3].scores.values()) if result.stage_trace and len(result.stage_trace) > 3 else 0.0
+                snr_norm = float(min(1.0, max(0.0, (ch.snr_db + 5.0) / 30.0)))
+                named_protocol_bonus = 1.0 if result.protocol not in {"Unknown Digital Signal", "Unknown Narrowband Digital Signal", "Unknown Signal"} else 0.0
+                channel_score = (
+                    0.45 * float(result.confidence)
+                    + 0.2 * protocol_likelihood
+                    + 0.2 * feature_consistency
+                    + 0.1 * snr_norm
+                    + 0.05 * named_protocol_bonus
+                )
+                per_channel_scores.append(
+                    {
+                        "channel_index": float(c_idx),
+                        "frequency_offset_hz": float(ch.frequency_offset_hz),
+                        "bandwidth_hz": float(ch.bandwidth_hz),
+                        "snr_db": float(ch.snr_db),
+                        "feature_consistency": float(feature_consistency),
+                        "protocol_likelihood": float(protocol_likelihood),
+                        "selection_score": float(channel_score),
+                        "confidence": float(result.confidence),
+                        "modulation": result.modulation,
+                        "protocol": result.protocol,
+                    }
+                )
+                ranked.append((channel_score, result, ch.frequency_offset_hz))
 
-            stage1 = self.classifier._stage_signal_nature(features)
-            stage2 = self.classifier._stage_channel(features, stage1.selected)
-            stage3 = self.classifier._stage_modulation(features, stage1.selected, stage2.selected)
-            protocol_scores = detect_protocols(features, stage2.selected, stage3.selected, stage1.selected)
-            stage_trace = self.classifier.classify(features, protocol_scores)
-            constraints = apply_physics_constraints(
-                stage_trace[1].selected,
-                stage_trace[2].scores,
-                stage_trace[3].scores,
-                features,
-            )
-            yield self.decision_engine.build_result(stage_trace, features, constraints)
+            ranked.sort(key=lambda x: x[0], reverse=True)
+            _, best_result, best_offset = ranked[0]
+            best_result.best_channel_frequency_offset_hz = float(best_offset)
+            best_result.per_channel_classification_scores = per_channel_scores
+            best_result.feature_summary["best_channel_frequency_offset_hz"] = float(best_offset)
+            yield best_result
 
-    def _build_plot_data(self, iq: np.ndarray) -> dict:
+    def _classify_single_channel(self, iq: np.ndarray, fs: float, cache_key: tuple) -> PipelineResult:
+        features = extract_features(iq, fs, cache_key=cache_key, use_parallel=True)
+        stage1 = self.classifier._stage_signal_nature(features)
+        stage2 = self.classifier._stage_channel(features, stage1.selected)
+        stage3 = self.classifier._stage_modulation(features, stage1.selected, stage2.selected)
+        protocol_scores = detect_protocols(features, stage2.selected, stage3.selected, stage1.selected)
+        stage_trace = self.classifier.classify(features, protocol_scores)
+
+        constraints = apply_physics_constraints(
+            stage_trace[1].selected,
+            stage_trace[2].scores,
+            stage_trace[3].scores,
+            features,
+        )
+        return self.decision_engine.build_result(stage_trace, features, constraints)
+
+    def _build_plot_data(self, iq: np.ndarray, fs: float) -> dict:
         if iq.size > self.max_plot_samples:
             sel = np.linspace(0, iq.size - 1, self.max_plot_samples, dtype=np.int64)
             iq_plot = iq[sel]
@@ -99,7 +181,7 @@ class SigIntPipeline:
             iq_plot = iq
 
         n = iq_plot.size
-        time = np.arange(n) / self.sample_rate
+        time = np.arange(n) / fs
 
         nfft = 16384 if n >= 16384 else max(1024, 1 << (n - 1).bit_length())
         segment = iq_plot[:nfft]
@@ -110,11 +192,11 @@ class SigIntPipeline:
 
         window = np.hanning(nfft)
         spec = np.fft.fftshift(np.fft.fft(segment * window))
-        freq = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / self.sample_rate))
+        freq = np.fft.fftshift(np.fft.fftfreq(nfft, d=1.0 / fs))
         psd_db = 20.0 * np.log10(np.abs(spec) + 1e-12)
 
         phase = np.unwrap(np.angle(iq_plot))
-        inst_f = np.diff(phase, prepend=phase[0]) * self.sample_rate / (2.0 * np.pi)
+        inst_f = np.diff(phase, prepend=phase[0]) * fs / (2.0 * np.pi)
 
         if_win = max(3, min(31, (inst_f.size // 4000) | 1))
         if if_win > 1 and inst_f.size >= if_win:

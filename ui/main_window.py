@@ -207,6 +207,7 @@ class MainWindow(QMainWindow):
             f"Protocol: {result.protocol}",
             f"Application: {result.application}",
             f"Confidence: {result.confidence * 100:.2f}%",
+            f"Best Channel Offset (Hz): {result.best_channel_frequency_offset_hz:.1f}",
             "",
             "Top 3 Candidates:",
         ]
@@ -214,6 +215,22 @@ class MainWindow(QMainWindow):
         for i, c in enumerate(result.top_candidates, start=1):
             lines.append(
                 f"{i}. {c.signal_type}/{c.channel_type}/{c.modulation}/{c.protocol}/{c.application} - {c.confidence * 100:.2f}%"
+            )
+
+        lines.append("")
+        lines.append("Per-channel Classification Scores:")
+        for ch in result.per_channel_classification_scores:
+            lines.append(
+                "- idx={idx:.0f}, f_off={fo:.1f} Hz, bw={bw:.1f} Hz, SNR={snr:.2f} dB, sel={sel:.3f}, conf={conf:.3f}, mod={mod}, proto={proto}".format(
+                    idx=float(ch.get("channel_index", 0.0)),
+                    fo=float(ch.get("frequency_offset_hz", 0.0)),
+                    bw=float(ch.get("bandwidth_hz", 0.0)),
+                    snr=float(ch.get("snr_db", 0.0)),
+                    sel=float(ch.get("selection_score", 0.0)),
+                    conf=float(ch.get("confidence", 0.0)),
+                    mod=str(ch.get("modulation", "")),
+                    proto=str(ch.get("protocol", "")),
+                )
             )
 
         lines.append("")
